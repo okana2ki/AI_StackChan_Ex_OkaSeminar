@@ -1,0 +1,43 @@
+## アプリ固有の設定ファイル
+# AI機能 (LLM, TTS, STT, Wakeword)
+llm:
+  type: 3                            # 0:ChatGPT  1:ModuleLLM  2:ModuleLLM(Function Calling)  3:Gemini
+                                     # ★岡ゼミ版は Gemini を使うので 3。変更不要。
+  model: "gpt-4o-mini"              # ChatGPT モデル指定。未記載または空欄の場合は gpt-4o-mini を使用
+
+tts:
+  type: 0                            # 0:VOICEVOX  1:ElevenLabs  2:OpenAI TTS  3:AquesTalk 4:ModuleLLM
+  model: ""                          # VOICEVOX, AquesTalk (modelは未対応)
+  #model: "eleven_multilingual_v2"    # ElevenLabs
+  #model: "tts-1"                     # OpenAI TTS
+  #model: "melotts-ja-jp"             # ModuleLLM (日本語)  ※モデル指定なしの場合は英語
+  voice: "89"                         # VOICEVOX (3:ずんだもん, 47:ナースロボ_タイプT, 89:Voidoll)
+  #voice: "AZnzlk1XvdvUeBnXmlld"      # ElevenLabs
+  #voice: "alloy"                     # OpenAI TTS
+  #voice: ""                          # AquesTalk, ModuleLLM (voiceは未対応)
+
+stt:
+  type: 1                            # 0:Google STT  1:OpenAI Whisper  2:ModuleLLM(ASR)  3:ModuleLLM(Whisper)
+
+wakeword:
+  type: 0                            # 0:SimpleVox  1:ModuleLLM(KWS)
+  keyword: ""                        # SimpleVox (初期設定は不可。ボタンB長押しで登録)
+  #keyword: "HI STUCK"                # ModuleLLM(KWS)
+
+# ModuleLLM
+moduleLLM:
+  # Serial Pin
+  # Core2 Rx:13,Tx:14
+  # CoreS3 Rx:18,Tx:17
+  rxPin: 13
+  txPin: 14
+
+# 相槌音声
+ack:
+  speakerId: -1                        # 使用する話者ID。-1 の場合は tts.voice を自動使用 (WebVoiceVox 時)
+
+# キャラクター設定
+character:
+  name: "okazemi"                      # /characters/{name}.yaml を読み込む。空欄の場合はデフォルト
+                                       # ★butler は返答が長く授業に不向きなため okazemi を既定にしています
+

@@ -1,0 +1,397 @@
+#include <Arduino.h>
+#include <M5Unified.h>
+#include <SPIFFS.h>
+#include <Avatar.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include "rootCA/rootCACertificate.h"
+#include <ArduinoJson.h>
+#include "SpiRamJsonDocument.h"
+#include "ChatGPT.h"
+#include "../ChatHistory.h"
+#include "FunctionCall.h"
+#include "MCPClient.h"
+#include "Robot.h"
+#include "StackChanMind.h"
+#include "mood/MoodManager.h"
+
+using namespace m5avatar;
+extern Avatar avatar;
+
+
+const String json_ChatString = 
+"{\"model\": \"gpt-4o-mini\","
+  "\"messages\": [{\"role\": \"system\", \"content\": \"\"},"     // ユーザーが設定するロール
+                  "{\"role\": \"system\", \"content\": \"\"},"    // システム用のロール
+                  "{\"role\": \"system\", \"content\": \"User Info: \"}],"  // 長期記憶の要約
+  "\"functions\": [],"
+  "\"function_call\":\"auto\""
+"}";
+
+
+ChatGPT::ChatGPT(llm_param_t param, int _promptMaxSize)
+  : LLMBase(param, _promptMaxSize)
+{
+  initMcpClientList(mcpClient, param.llm_conf.mcpServer, param.llm_conf.nMcpServers);
+  fnCall = new FunctionCall(param, this, mcpClient);
+  //fnCall->init_func_call_settings(robot->m_config);
+
+  enableMemory(param.llm_conf.enableMemory);
+  if(enableMemory()){
+    Serial.println("Memory is enabled");
+    M5.Lcd.println("Memory is enabled");
+  }
+
+  if(promptMaxSize != 0){
+    load_role();
+  }
+  else{
+    Serial.println("Prompt buffer is disabled");
+  }
+}
+
+
+bool ChatGPT::init_chat_doc(const char *data)
+{
+  DeserializationError error = deserializeJson(chat_doc, data);
+  if (error) {
+    Serial.println("DeserializationError");
+
+    String json_str; //= JSON.stringify(chat_doc);
+    serializeJsonPretty(chat_doc, json_str);  // 文字列をシリアルポートに出力する
+    Serial.println(json_str);
+
+    return false;
+  }
+  String json_str; //= JSON.stringify(chat_doc);
+  serializeJsonPretty(chat_doc, json_str);  // 文字列をシリアルポートに出力する
+//  Serial.println(json_str);
+  return true;
+}
+
+void ChatGPT::load_role(){
+  String role = "";
+  String userInfo = "User Info: ";
+  String systemRole = "";
+  Serial.println("Load role from SPIFFS.");
+  if(enableMemory()){
+    systemRole = systemRole_memory;
+  }else{
+    systemRole = systemRole_noMemory;
+  }
+
+  if(load_system_prompt_from_spiffs()){
+    role = String((const char*)systemPrompt["messages"][SYSTEM_PROMPT_INDEX_USER_ROLE]["content"]);
+    //Serial.printf("role length: %d\n", role.length());
+    if (role == "") {
+      Serial.println("SPIFFS user role is empty. set default role.");
+      role = defaultRole;
+    }
+
+    userInfo = String((const char*)systemPrompt["messages"][SYSTEM_PROMPT_INDEX_USER_INFO]["content"]);
+    //Serial.println(userInfo);
+    int idx = userInfo.indexOf("User Info");
+    if(idx < 0 || !enableMemory()){
+      userInfo = "User Info: ";
+    }
+  }else{
+    // load_system_prompt_from_spiffs()内でSPIFFSからの取得失敗かつ
+    // デフォルトのシステムプロンプト設定に失敗した場合（通常起こり得ない）。
+    role = defaultRole;
+    userInfo = "User Info: ";
+  }
+
+  init_chat_doc(json_ChatString.c_str());   // chat_docを初期化
+
+  // SC_ExConfig.yaml の llm.model が指定されていればモデルを上書きする（未指定時は gpt-4o-mini）
+  if (param.llm_conf.model.length() > 0
+      && param.llm_conf.model != "null"
+      && param.llm_conf.model != "") {
+    chat_doc["model"] = param.llm_conf.model;
+    Serial.printf("LLM model: %s\n", param.llm_conf.model.c_str());
+  }
+
+  chat_doc["messages"][SYSTEM_PROMPT_INDEX_USER_ROLE]["content"] = role;
+  chat_doc["messages"][SYSTEM_PROMPT_INDEX_SYSTEM_ROLE]["content"] = systemRole;
+  chat_doc["messages"][SYSTEM_PROMPT_INDEX_USER_INFO]["content"] = userInfo;
+
+  /*
+   * MCP tools listをfunctionとして挿入
+   */
+  for(int s=0; s<param.llm_conf.nMcpServers; s++){
+    if(!mcpClient[s]->isConnected()){
+      continue;
+    }
+
+    for(int t=0; t<mcpClient[s]->nTools; t++){
+      chat_doc["functions"].add(mcpClient[s]->toolsListDoc["result"]["tools"][t]);
+    }
+  }
+
+  /*
+   * FunctionCall.cppで定義したfunctionを挿入
+   */
+  SpiRamJsonDocument functionsDoc(1024*10);
+  DeserializationError error = deserializeJson(functionsDoc, json_Functions.c_str());
+  if (error) {
+    Serial.println("load_role: JSON deserialization error");
+  }
+
+  int nFuncs = functionsDoc.size();
+  for(int i=0; i<nFuncs; i++){
+    chat_doc["functions"].add(functionsDoc[i]);
+  }
+
+  /*
+   * InitBuffer(会話履歴を挿入する前のプロンプト)を初期化
+   */
+  serializeJson(chat_doc, InitBuffer);
+  String json_str;
+  serializeJsonPretty(chat_doc, json_str);
+  Serial.println("Initialized prompt:");
+  Serial.println(json_str);
+}
+
+
+String ChatGPT::https_post_json(const char* url, const char* json_string, const char* root_ca) {
+  String payload = "";
+  WiFiClientSecure *client = new WiFiClientSecure;
+  if(client) {
+    client -> setCACert(root_ca);
+    {
+      // Add a scoping block for HTTPClient https to make sure it is destroyed before WiFiClientSecure *client is 
+      HTTPClient https;
+      https.setTimeout( 65000 ); 
+  
+      Serial.print("[HTTPS] begin...\n");
+      if (https.begin(*client, url)) {  // HTTPS
+        Serial.print("[HTTPS] POST...\n");
+        // start connection and send HTTP header
+        https.addHeader("Content-Type", "application/json");
+        https.addHeader("Authorization", String("Bearer ") + param.api_key);
+        int httpCode = https.POST((uint8_t *)json_string, strlen(json_string));
+  
+        // httpCode will be negative on error
+        if (httpCode > 0) {
+          // HTTP header has been send and Server response header has been handled
+          Serial.printf("[HTTPS] POST... code: %d\n", httpCode);
+  
+          // file found at server
+          if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+            payload = https.getString();
+            Serial.println("//////////////");
+            Serial.println(payload);
+            Serial.println("//////////////");
+          }
+        } else {
+          Serial.printf("[HTTPS] POST... failed, error: %s\n", https.errorToString(httpCode).c_str());
+        }  
+        https.end();
+      } else {
+        Serial.printf("[HTTPS] Unable to connect\n");
+      }
+      // End extra scoping block
+    }  
+    delete client;
+  } else {
+    Serial.println("Unable to create client");
+  }
+  return payload;
+}
+
+
+#define MAX_REQUEST_COUNT  (10)
+void ChatGPT::chat(String text, const char *base64_buf) {
+  static String response = "";
+  String calledFunc = "";
+  //String funcCallMode = "auto";
+  bool image_flag = false;
+
+  //Serial.println(InitBuffer);
+  //init_chat_doc(InitBuffer.c_str());
+
+  // 質問をチャット履歴に追加
+  if(base64_buf == NULL){
+    chatHistory.push_back(String("user"), String(""), text);
+  }
+  else{
+    //画像が入力された場合は第2引数を"image"にして識別する
+    chatHistory.push_back(String("user"), String("image"), text);
+  }
+
+  // functionの実行が要求されなくなるまで繰り返す
+  for (int reqCount = 0; reqCount < MAX_REQUEST_COUNT; reqCount++)
+  {
+    init_chat_doc(InitBuffer.c_str());
+
+    // システムロールにキャラクター会話指示と感情指示を追加する
+    {
+      String emotionInstr =
+        String("あなたの現在の感情は「") + stackChanMind.emotionToString() + "」です。"
+        "発話の末尾に [META]{...}[/META] 形式で感情と気分変化を付与してください。"
+        "例: [META]{\"emotion\":\"happy\",\"joy\":0.3,\"trust\":0.1}[/META] "
+        "emotionの選択肢: happy/neutral/sad/angry/doubt/sleepy "
+        "joy・trustは会話に応じた変化量（-1.0〜+1.0、変化小さければ0.0）";
+      String cur = String((const char*)chat_doc["messages"][SYSTEM_PROMPT_INDEX_SYSTEM_ROLE]["content"]);
+      String appended = cur;
+      if (!_talkPrompt.isEmpty()) appended += " " + _talkPrompt;
+      appended += " " + emotionInstr;
+      chat_doc["messages"][SYSTEM_PROMPT_INDEX_SYSTEM_ROLE]["content"] = appended;
+    }
+
+    //if(reqCount == (MAX_REQUEST_COUNT - 1)){
+    //  funcCallMode = String("none");
+    //}
+
+    for (int i = 0; i < chatHistory.get_size(); i++)
+    {
+      JsonArray messages = chat_doc["messages"];
+      JsonObject systemMessage1 = messages.createNestedObject();
+
+      if(chatHistory.get_role(i).equals(String("function"))){
+        //Function Callingの場合
+        systemMessage1["role"] = chatHistory.get_role(i);
+        systemMessage1["name"] = chatHistory.get_funcName(i);
+        systemMessage1["content"] = chatHistory.get_content(i);
+      }
+      else if(chatHistory.get_funcName(i).equals(String("image"))){
+        //画像がある場合
+        //このようなJSONを作成する
+        // messages=[
+        //      {"role": "user", "content": [
+        //          {"type": "text", "text": "この三角形の面積は？"},
+        //          {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+        //      ]}
+        //  ],
+
+        String image_url_str = String("data:image/jpeg;base64,") + String(base64_buf); 
+
+        systemMessage1["role"] = chatHistory.get_role(i);
+        JsonObject content_text = systemMessage1["content"].createNestedObject();
+        content_text["type"] = "text";
+        content_text["text"] = chatHistory.get_content(i);
+        JsonObject content_image = systemMessage1["content"].createNestedObject();
+        content_image["type"] = "image_url";
+        content_image["image_url"]["url"] = image_url_str.c_str();
+
+        //次回以降は画像の埋め込みをしないよう、識別用の文字列"image"を消す
+        chatHistory.set_funcName(i, "");
+      }
+      else{
+        systemMessage1["role"] = chatHistory.get_role(i);
+        systemMessage1["content"] = chatHistory.get_content(i);
+      }
+
+    }
+
+    String json_string;
+    serializeJson(chat_doc, json_string);
+
+    //serializeJsonPretty(chat_doc, json_string);
+  Serial.println("====================");
+  Serial.println(json_string);
+  Serial.println("====================");
+
+    unsigned long t_llm_start = millis();
+    response = execChatGpt(json_string, calledFunc);
+    Serial.printf("[TIMING] C LLM (ChatGPT API): %lu ms\n", millis() - t_llm_start);
+
+    if(calledFunc == ""){   // Function Callなし ／ Function Call繰り返しの完了
+      chatHistory.push_back(String("assistant"), String(""), response);   // 返答をチャット履歴に追加
+      robot->speech(response);
+      break;
+    }
+    else{   // Function Call繰り返し中。ループを継続
+      chatHistory.push_back(String("function"), calledFunc, response);   // 返答をチャット履歴に追加   
+    }
+
+  }
+
+  //チャット履歴の容量を圧迫しないように、functionロールを削除する
+  chatHistory.clean_function_role();
+}
+
+String ChatGPT::execChatGpt(String json_string, String& calledFunc) {
+  String response = "";
+  avatar.setSpeechFont(&fonts::efontJA_16);
+  avatar.setSpeechText("考え中…");
+  String ret = https_post_json("https://api.openai.com/v1/chat/completions", json_string.c_str(), root_ca_openai);
+  avatar.setSpeechText("");
+  Serial.println(ret);
+  if(ret != ""){
+    DynamicJsonDocument doc(2000);
+    DeserializationError error = deserializeJson(doc, ret.c_str());
+    if (error) {
+      Serial.print(F("deserializeJson() failed: "));
+      Serial.println(error.f_str());
+      avatar.setExpression(Expression::Sad);
+      avatar.setSpeechText("エラーです");
+      response = "エラーです";
+      delay(1000);
+      avatar.setSpeechText("");
+      avatar.setExpression(Expression::Neutral);
+    }else{
+      const char* data = doc["choices"][0]["message"]["content"];
+      
+      // content = nullならfunction call
+      if(data == 0){
+        const char* name = doc["choices"][0]["message"]["function_call"]["name"];
+        const char* args = doc["choices"][0]["message"]["function_call"]["arguments"];
+        calledFunc = String(name);
+        //avatar.setSpeechFont(&fonts::efontJA_12);
+        //avatar.setSpeechText(name);
+        response = fnCall->exec_calledFunc(name, args);
+      }
+      else{
+        Serial.println(data);
+        response = String(data);
+        std::replace(response.begin(),response.end(),'\n',' ');
+
+        // [META]...[/META] から感情名を抽出して更新し、タグを除去する
+        // LLMが全角【META】を出力する場合があるため半角に正規化する
+        response.replace("【META】",  "[META]");
+        response.replace("【/META】", "[/META]");
+        {
+          int metaStart = response.indexOf("[META]");
+          int metaEnd   = response.indexOf("[/META]");
+          if (metaStart >= 0 && metaEnd > metaStart) {
+            // 正常形式: [META]{...}[/META]
+            String metaContent = response.substring(metaStart + 6, metaEnd);
+            DynamicJsonDocument metaDoc(128);
+            if (!deserializeJson(metaDoc, metaContent)) {
+              const char* emotion = metaDoc["emotion"];
+              if (emotion) stackChanMind.setEmotion(String(emotion));
+              if (g_moodManager) {
+                if (metaDoc.containsKey("joy"))   g_moodManager->addJoy(metaDoc["joy"].as<float>());
+                if (metaDoc.containsKey("trust"))  g_moodManager->addTrust(metaDoc["trust"].as<float>());
+                Serial.printf("[META] joy=%.2f trust=%.2f\n",
+                              g_moodManager->getJoy(), g_moodManager->getTrust());
+              }
+            }
+            response = response.substring(0, metaStart) + response.substring(metaEnd + 7);
+            response.trim();
+          } else if (metaEnd >= 0) {
+            // 不正形式: [META]なしで[/META]が出現した場合は[/META]以降を全て除去
+            response = response.substring(0, metaEnd);
+            response.trim();
+          }
+          // 残存する[META][/META]タグを念のため除去
+          response.replace("[META]",  "");
+          response.replace("[/META]", "");
+        }
+
+        calledFunc = String("");
+      }
+    }
+  } else {
+    avatar.setExpression(Expression::Sad);
+    avatar.setSpeechFont(&fonts::efontJA_16);
+    avatar.setSpeechText("わかりません");
+    response = "わかりません";
+    delay(1000);
+    avatar.setSpeechText("");
+    avatar.setExpression(Expression::Neutral);
+  }
+  return response;
+}
+
