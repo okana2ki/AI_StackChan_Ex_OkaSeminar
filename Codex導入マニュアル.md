@@ -4,8 +4,8 @@
 所要 **15〜20分**。**Windows はネイティブ対応**なので、WSL（Linux環境）は不要です。
 
 > 本書は 2026年9月時点の公式ドキュメントに基づいています。
-> Codex は更新が速いため、うまくいかない場合は公式をご確認ください。
-> https://developers.openai.com/codex/
+> Codex は更新が速いため、うまくいかない場合は公式をご確認ください。  
+> https://developers.openai.com/codex/  
 > https://learn.chatgpt.com/docs/app
 
 ---
