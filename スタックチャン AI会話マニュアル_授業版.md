@@ -679,7 +679,8 @@ C:\stackchan\firmware
 
 ## 8-2. Wi-FiとAPIキーの設定
 
-SDカードの `/yaml/SC_SecConfig.yaml` をVSCodeで開いて編集します。
+SDカードの `/yaml/SC_SecConfig.yaml` をVSCodeで開いて編集します。  
+授業で提供するWi-FiのSSIDとパスワードはmoodle一番上の「一般」トピックに記載。
 
 ```yaml
 wifi:
