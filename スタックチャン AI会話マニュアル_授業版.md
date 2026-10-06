@@ -1541,6 +1541,14 @@ print(df.describe())
 
 ---
 
+---
+
+# 付録C　出荷時ファームウェアの復元
+
+[このページ](https://docs.m5stack.com/ja/StackChan)の左サイドパネルの目次から「出荷時ファームウェアの復元」を探して下さい。
+
+---
+
 # 参考リンク
 
 - 使用したプログラム：https://github.com/Beko6648/AI_StackChan_Ex
